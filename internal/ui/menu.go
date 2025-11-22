@@ -5,6 +5,7 @@ package ui
 
 import (
 	"fmt"
+	"log/slog"
 	"regexp"
 	"runtime"
 	"sort"
@@ -19,7 +20,7 @@ import (
 
 const (
 	menuIndexFmt = " [key:-:b]<%d> [fg:-:fgstyle]%s "
-	maxRows      = 6
+	maxRows      = 8
 )
 
 var menuRX = regexp.MustCompile(`\d`)
@@ -28,7 +29,8 @@ var menuRX = regexp.MustCompile(`\d`)
 type Menu struct {
 	*tview.Table
 
-	styles *config.Styles
+	styles        *config.Styles
+	globalHintsFn func() model.MenuHints
 }
 
 // NewMenu returns a new menu.
@@ -75,20 +77,31 @@ func (m *Menu) StackTop(t model.Component) {
 	m.HydrateMenu(t.Hints())
 }
 
+// SetGlobalHintsProvider registers a provider for global menu hints.
+func (m *Menu) SetGlobalHintsProvider(f func() model.MenuHints) {
+	m.globalHintsFn = f
+}
+
 // HydrateMenu populate menu ui from hints.
 func (m *Menu) HydrateMenu(hh model.MenuHints) {
 	m.Clear()
+
+	if m.globalHintsFn != nil {
+		if gh := m.globalHintsFn(); len(gh) > 0 {
+			cp := make(model.MenuHints, len(hh))
+			copy(cp, hh)
+			hh = append(cp, gh...)
+		}
+	}
+
+	// Sort all hints first
 	sort.Sort(hh)
 
-	table := make([]model.MenuHints, maxRows+1)
-	colCount := (len(hh) / maxRows) + 1
-	if m.hasDigits(hh) {
-		colCount++
-	}
-	for row := range maxRows {
-		table[row] = make(model.MenuHints, colCount)
-	}
-	t := m.buildMenuTable(hh, table, colCount)
+	// Separate hints into three categories
+	skyHints, numHints, otherHints := m.categorizeHints(hh)
+
+	// Build the table with clear column separation
+	t := m.buildSimpleMenuTable(skyHints, numHints, otherHints)
 
 	for row := range t {
 		for col := range len(t[row]) {
@@ -102,48 +115,123 @@ func (m *Menu) HydrateMenu(hh model.MenuHints) {
 	}
 }
 
-func (*Menu) hasDigits(hh model.MenuHints) bool {
+// categorizeHints separates hints into three groups: Sky, Numeric, and Other.
+func (*Menu) categorizeHints(hh model.MenuHints) (sky, num, other model.MenuHints) {
 	for _, h := range hh {
 		if !h.Visible {
 			continue
 		}
-		if menuRX.MatchString(h.Mnemonic) {
-			return true
+
+		if strings.HasPrefix(h.Description, "Sky") {
+			sky = append(sky, h)
+		} else if menuRX.MatchString(h.Mnemonic) {
+			num = append(num, h)
+		} else {
+			other = append(other, h)
 		}
 	}
-	return false
+
+	slog.Info("Categorized hints",
+		"skyCount", len(sky),
+		"numCount", len(num),
+		"otherCount", len(other))
+
+	return sky, num, other
 }
 
-func (m *Menu) buildMenuTable(hh model.MenuHints, table []model.MenuHints, colCount int) [][]string {
-	var row, col int
-	firstCmd := true
-	maxKeys := make([]int, colCount)
-	for _, h := range hh {
-		if !h.Visible {
-			continue
-		}
+// buildSimpleMenuTable creates a simple table layout:
+// Column 0: Sky commands
+// Column 1: Numeric commands
+// Column 2+: Other commands (alphabetically sorted)
+func (m *Menu) buildSimpleMenuTable(skyHints, numHints, otherHints model.MenuHints) [][]string {
+	// Calculate how many columns we need
+	colCount := 0
+	if len(skyHints) > 0 {
+		colCount++ // Sky column
+	}
+	if len(numHints) > 0 {
+		colCount++ // Numeric column
+	}
+	if len(otherHints) > 0 {
+		// Other commands might need multiple columns
+		otherCols := (len(otherHints) + maxRows - 1) / maxRows
+		colCount += otherCols
+	}
 
-		if !menuRX.MatchString(h.Mnemonic) && firstCmd {
-			row, col, firstCmd = 0, col+1, false
-			if table[0][0].IsBlank() {
-				col = 0
+	slog.Info("Building simple menu table",
+		"skyHints", len(skyHints),
+		"numHints", len(numHints),
+		"otherHints", len(otherHints),
+		"totalColumns", colCount)
+
+	// Create the table structure
+	table := make([][]model.MenuHint, maxRows)
+	for i := range table {
+		table[i] = make([]model.MenuHint, colCount)
+	}
+
+	maxKeys := make([]int, colCount)
+	currentCol := 0
+
+	// Fill column 0 with Sky commands
+	if len(skyHints) > 0 {
+		for i, h := range skyHints {
+			if i >= maxRows {
+				break
+			}
+			table[i][currentCol] = h
+			if len(h.Mnemonic) > maxKeys[currentCol] {
+				maxKeys[currentCol] = len(h.Mnemonic)
+			}
+			slog.Debug("Placed Sky hint", "row", i, "col", currentCol, "mnemonic", h.Mnemonic, "desc", h.Description)
+		}
+		currentCol++
+	}
+
+	// Fill next column with Numeric commands
+	if len(numHints) > 0 {
+		for i, h := range numHints {
+			if i >= maxRows {
+				break
+			}
+			table[i][currentCol] = h
+			if len(h.Mnemonic) > maxKeys[currentCol] {
+				maxKeys[currentCol] = len(h.Mnemonic)
+			}
+			slog.Debug("Placed numeric hint", "row", i, "col", currentCol, "mnemonic", h.Mnemonic, "desc", h.Description)
+		}
+		currentCol++
+	}
+
+	// Fill remaining columns with Other commands
+	if len(otherHints) > 0 {
+		row := 0
+		for _, h := range otherHints {
+			table[row][currentCol] = h
+			if len(h.Mnemonic) > maxKeys[currentCol] {
+				maxKeys[currentCol] = len(h.Mnemonic)
+			}
+			slog.Debug("Placed other hint", "row", row, "col", currentCol, "mnemonic", h.Mnemonic, "desc", h.Description)
+
+			row++
+			if row >= maxRows {
+				row = 0
+				currentCol++
+				if currentCol >= colCount {
+					break
+				}
 			}
 		}
-		if maxKeys[col] < len(h.Mnemonic) {
-			maxKeys[col] = len(h.Mnemonic)
-		}
-		table[row][col] = h
-		row++
-		if row >= maxRows {
-			row, col = 0, col+1
-		}
 	}
 
-	out := make([][]string, len(table))
+	// Convert table to strings
+	out := make([][]string, maxRows)
 	for r := range out {
-		out[r] = make([]string, len(table[r]))
+		out[r] = make([]string, colCount)
+		for c := range colCount {
+			out[r][c] = m.formatMenu(table[r][c], maxKeys[c])
+		}
 	}
-	m.layout(table, maxKeys, out)
 
 	return out
 }

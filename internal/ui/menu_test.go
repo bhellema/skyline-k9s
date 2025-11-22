@@ -4,6 +4,8 @@
 package ui_test
 
 import (
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/derailed/k9s/internal/config"
@@ -23,6 +25,35 @@ func TestNewMenu(t *testing.T) {
 	assert.Equal(t, " [#ff00ff:-:b]<0> [#ffffff:-:d]zero ", v.GetCell(0, 0).Text)
 	assert.Equal(t, " [#1e90ff:-:b]<a> [#ffffff:-:d]bleeA ", v.GetCell(0, 1).Text)
 	assert.Equal(t, " [#1e90ff:-:b]<b> [#ffffff:-:d]bleeB ", v.GetCell(1, 1).Text)
+}
+
+func TestMenuWithGlobalHints(t *testing.T) {
+	v := ui.NewMenu(config.NewStyles())
+	v.SetGlobalHintsProvider(func() model.MenuHints {
+		return model.MenuHints{
+			{Mnemonic: "g", Description: "grafana", Visible: true},
+		}
+	})
+	v.HydrateMenu(model.MenuHints{
+		{Mnemonic: "a", Description: "alpha", Visible: true},
+	})
+
+	var cells []string
+	for row := range v.GetRowCount() {
+		for col := range v.GetColumnCount() {
+			text := v.GetCell(row, col).Text
+			if strings.TrimSpace(text) != "" {
+				cells = append(cells, text)
+			}
+		}
+	}
+	expected := []string{
+		" [#1e90ff:-:b]<a> [#ffffff:-:d]alpha ",
+		" [#1e90ff:-:b]<g> [#ffffff:-:d]grafana ",
+	}
+	sort.Strings(cells)
+	sort.Strings(expected)
+	assert.Equal(t, expected, cells)
 }
 
 func TestActionHints(t *testing.T) {

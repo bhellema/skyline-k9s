@@ -10,7 +10,9 @@ import (
 	"log/slog"
 	"maps"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -36,10 +38,15 @@ import (
 var ExitStatus = ""
 
 const (
-	splashDelay      = 1 * time.Second
-	clusterRefresh   = 15 * time.Second
-	clusterInfoWidth = 50
-	clusterInfoPad   = 15
+	splashDelay            = 1 * time.Second
+	clusterRefresh         = 15 * time.Second
+	clusterInfoWidth       = 50
+	clusterInfoPad         = 15
+	clusterInfoMinLines    = 7
+	grafanaURLTimeout      = 8 * time.Second
+	grafanaURLCmd          = "sky"
+	grafanaURLSubCmd       = "url"
+	grafanaGrafanaResource = "grafana-red"
 )
 
 // App represents an application view.
@@ -70,6 +77,9 @@ func NewApp(cfg *config.Config) *App {
 	a.ReloadStyles()
 
 	a.Views()["statusIndicator"] = ui.NewStatusIndicator(a.App, a.Styles)
+	menu := ui.NewMenu(a.Styles)
+	menu.SetGlobalHintsProvider(a.globalHints)
+	a.Views()["menu"] = menu
 	a.Views()["clusterInfo"] = NewClusterInfo(&a)
 
 	return &a
@@ -247,6 +257,8 @@ func (a *App) bindKeys() {
 	a.AddActions(ui.NewKeyActionsFromMap(ui.KeyMap{
 		tcell.KeyCtrlE:     ui.NewSharedKeyAction("ToggleHeader", a.toggleHeaderCmd, false),
 		tcell.KeyCtrlG:     ui.NewSharedKeyAction("ToggleCrumbs", a.toggleCrumbsCmd, false),
+		tcell.KeyF1:        ui.NewSharedKeyAction("Sky Grafana Red", a.openGrafanaCmd, true),
+		tcell.KeyF2:        ui.NewSharedKeyAction("Sky Pipelines", a.skyPipelinesCmd, true),
 		ui.KeyHelp:         ui.NewSharedKeyAction("Help", a.helpCmd, false),
 		ui.KeyLeftBracket:  ui.NewSharedKeyAction("Go Back", a.previousCommand, false),
 		ui.KeyRightBracket: ui.NewSharedKeyAction("Go Forward", a.nextCommand, false),
@@ -271,7 +283,7 @@ func (a *App) toggleHeader(header, logo bool) {
 	}
 	if a.showHeader {
 		flex.RemoveItemAtIndex(0)
-		flex.AddItemAtIndex(0, a.buildHeader(), 7, 1, false)
+		flex.AddItemAtIndex(0, a.buildHeader(), a.clusterInfoHeight(), 1, false)
 	} else {
 		flex.RemoveItemAtIndex(0)
 		flex.AddItemAtIndex(0, a.statusIndicator(), 1, 1, false)
@@ -320,6 +332,15 @@ func (a *App) buildHeader() tview.Primitive {
 	}
 
 	return header
+}
+
+func (a *App) clusterInfoHeight() int {
+	rows := a.clusterInfo().GetRowCount()
+	if rows < clusterInfoMinLines {
+		return clusterInfoMinLines
+	}
+
+	return rows
 }
 
 // Halt stop the application event loop.
@@ -788,4 +809,94 @@ func (a *App) clusterInfo() *ClusterInfo {
 
 func (a *App) statusIndicator() *ui.StatusIndicator {
 	return a.Views()["statusIndicator"].(*ui.StatusIndicator)
+}
+
+func (a *App) globalHints() model.MenuHints {
+	if a == nil || a.App == nil {
+		return nil
+	}
+	if a.GetActions() == nil {
+		return nil
+	}
+
+	return a.GetActions().SharedHints()
+}
+
+func (a *App) openGrafanaCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if evt != nil && evt.Key() == tcell.KeyF1 && a.Prompt().InCmdMode() {
+		return evt
+	}
+
+	go a.openGrafanaDashboard()
+
+	return nil
+}
+
+func (a *App) openGrafanaDashboard() {
+	ctx, cancel := context.WithTimeout(context.Background(), grafanaURLTimeout)
+	defer cancel()
+
+	url, err := fetchGrafanaURL(ctx)
+	if err != nil {
+		a.Flash().Err(fmt.Errorf("grafana url: %w", err))
+		return
+	}
+
+	if err := openBrowser(url); err != nil {
+		a.Flash().Err(fmt.Errorf("open browser: %w", err))
+		return
+	}
+
+	a.Flash().Info("Opened Sky Grafana Red dashboard")
+}
+
+func (a *App) skyPipelinesCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if evt != nil && evt.Key() == tcell.KeyF2 && a.Prompt().InCmdMode() {
+		return evt
+	}
+
+	top := a.Content.Top()
+	if top != nil && top.Name() == "sky-pipelines" {
+		a.Content.Pop()
+		return nil
+	}
+
+	if err := a.inject(NewSkyPipelines(a), false); err != nil {
+		a.Flash().Err(err)
+	}
+
+	a.Prompt().Deactivate()
+	return nil
+}
+
+func fetchGrafanaURL(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, grafanaURLCmd, grafanaURLSubCmd, grafanaGrafanaResource)
+	out, err := cmd.CombinedOutput()
+	outStr := strings.TrimSpace(string(out))
+	if err != nil {
+		if outStr != "" {
+			return "", fmt.Errorf("%w: %s", err, outStr)
+		}
+		return "", err
+	}
+	if outStr == "" {
+		return "", errors.New("empty response from sky")
+	}
+
+	return outStr, nil
+}
+
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+
+	return cmd.Start()
 }

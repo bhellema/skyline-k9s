@@ -4,12 +4,16 @@
 package model
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,10 +25,13 @@ import (
 )
 
 const (
-	k9sGitURL       = "https://api.github.com/repos/derailed/k9s/releases/latest"
-	cacheSize       = 10
-	cacheExpiry     = 1 * time.Hour
-	k9sLatestRevKey = "k9sRev"
+	k9sGitURL          = "https://api.github.com/repos/derailed/k9s/releases/latest"
+	cacheSize          = 10
+	cacheExpiry        = 1 * time.Hour
+	k9sLatestRevKey    = "k9sRev"
+	skyInspectTimeout  = 5 * time.Second // Reduced from 8s since it's now async
+	skyInspectBin      = "sky"
+	skyInspectResource = "cm"
 )
 
 // ClusterInfoListener registers a listener for model changes.
@@ -40,6 +47,10 @@ type ClusterInfoListener interface {
 type ClusterMeta struct {
 	Context, Cluster    string
 	User                string
+	Program             string
+	EnvironmentType     string
+	ReleaseID           string
+	Sandbox             string
 	K9sVer, K9sLatest   string
 	K8sVer              string
 	Cpu, Mem, Ephemeral int
@@ -48,14 +59,18 @@ type ClusterMeta struct {
 // NewClusterMeta returns a new instance.
 func NewClusterMeta() *ClusterMeta {
 	return &ClusterMeta{
-		Context:   client.NA,
-		Cluster:   client.NA,
-		User:      client.NA,
-		K9sVer:    client.NA,
-		K8sVer:    client.NA,
-		Cpu:       0,
-		Mem:       0,
-		Ephemeral: 0,
+		Context:         client.NA,
+		Cluster:         client.NA,
+		User:            client.NA,
+		Program:         client.NA,
+		EnvironmentType: client.NA,
+		ReleaseID:       client.NA,
+		Sandbox:         client.NA,
+		K9sVer:          client.NA,
+		K8sVer:          client.NA,
+		Cpu:             0,
+		Mem:             0,
+		Ephemeral:       0,
 	}
 }
 
@@ -68,6 +83,10 @@ func (c *ClusterMeta) Deltas(n *ClusterMeta) bool {
 	return c.Context != n.Context ||
 		c.Cluster != n.Cluster ||
 		c.User != n.User ||
+		c.Program != n.Program ||
+		c.EnvironmentType != n.EnvironmentType ||
+		c.ReleaseID != n.ReleaseID ||
+		c.Sandbox != n.Sandbox ||
 		c.K8sVer != n.K8sVer ||
 		c.K9sVer != n.K9sVer ||
 		c.K9sLatest != n.K9sLatest
@@ -83,6 +102,7 @@ type ClusterInfo struct {
 	listeners []ClusterInfoListener
 	cache     *cache.LRUExpireCache
 	mx        sync.RWMutex
+	skyInfo   *skyCustomerInfo
 }
 
 // NewClusterInfo returns a new instance.
@@ -123,6 +143,7 @@ func (c *ClusterInfo) Reset(f dao.Factory) {
 
 	c.mx.Lock()
 	c.cluster, c.data = NewCluster(f), NewClusterMeta()
+	c.skyInfo = nil
 	c.mx.Unlock()
 
 	c.Refresh()
@@ -143,6 +164,18 @@ func (c *ClusterInfo) Refresh() {
 			data.Cpu, data.Mem, data.Ephemeral = mx.PercCPU, mx.PercMEM, mx.PercEphemeral
 		}
 	}
+
+	// Fetch sky customer info asynchronously to avoid blocking UI
+	go c.fetchSkyCustomerInfoAsync()
+
+	// Use cached sky info if available (from previous fetch)
+	if sky := c.getSkyInfoFromCache(); sky != nil {
+		data.Program = sky.Program
+		data.EnvironmentType = sky.EnvironmentType
+		data.ReleaseID = sky.ReleaseID
+		data.Sandbox = sky.Sandbox
+	}
+
 	data.K9sVer = c.version
 	v1 := NewSemVer(data.K9sVer)
 
@@ -199,6 +232,52 @@ func (c *ClusterInfo) fireNoMetaChanged(data *ClusterMeta) {
 	}
 }
 
+// fetchSkyCustomerInfoAsync fetches sky customer info in the background.
+// This prevents blocking the UI during startup.
+func (c *ClusterInfo) fetchSkyCustomerInfoAsync() {
+	defer func(t time.Time) {
+		slog.Debug("Sky customer info fetch time", slogs.Elapsed, time.Since(t))
+	}(time.Now())
+
+	info, err := fetchSkyCustomerInfo()
+	if err != nil {
+		slog.Debug("Sky customer info unavailable", slogs.Error, err)
+		return
+	}
+
+	c.mx.Lock()
+	c.skyInfo = info
+	c.mx.Unlock()
+
+	// Update cluster data with sky info
+	c.updateWithSkyInfo(info)
+}
+
+// getSkyInfoFromCache returns cached sky info without fetching.
+func (c *ClusterInfo) getSkyInfoFromCache() *skyCustomerInfo {
+	c.mx.RLock()
+	defer c.mx.RUnlock()
+	return c.skyInfo
+}
+
+// updateWithSkyInfo updates the cluster metadata with sky customer info.
+func (c *ClusterInfo) updateWithSkyInfo(sky *skyCustomerInfo) {
+	c.mx.Lock()
+	if c.data != nil {
+		c.data.Program = sky.Program
+		c.data.EnvironmentType = sky.EnvironmentType
+		c.data.ReleaseID = sky.ReleaseID
+		c.data.Sandbox = sky.Sandbox
+	}
+	data := c.data
+	c.mx.Unlock()
+
+	// Notify listeners that data was updated
+	if data != nil {
+		c.fireNoMetaChanged(data)
+	}
+}
+
 // Helpers...
 
 func fetchLatestRev() (string, error) {
@@ -235,4 +314,69 @@ func fetchLatestRev() (string, error) {
 	}
 
 	return "", errors.New("no version found")
+}
+
+type skyCustomerInfo struct {
+	Program         string
+	EnvironmentType string
+	ReleaseID       string
+	Sandbox         string
+}
+
+func fetchSkyCustomerInfo() (*skyCustomerInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), skyInspectTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, skyInspectBin, "inspect", skyInspectResource)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	info := parseSkyCustomerInfo(out)
+	if info == nil {
+		return nil, errors.New("malformed sky inspect cm output")
+	}
+
+	return info, nil
+}
+
+func parseSkyCustomerInfo(out []byte) *skyCustomerInfo {
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	values := make(map[string]string)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := normalizeSkyKey(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if key != "" {
+			values[key] = value
+		}
+	}
+
+	if len(values) == 0 {
+		return nil
+	}
+
+	return &skyCustomerInfo{
+		Program:         values["program"],
+		EnvironmentType: values["environmenttype"],
+		ReleaseID:       values["releaseid"],
+		Sandbox:         values["sandbox"],
+	}
+}
+
+func normalizeSkyKey(key string) string {
+	k := strings.ToLower(strings.TrimSpace(key))
+	k = strings.ReplaceAll(k, " ", "")
+	k = strings.ReplaceAll(k, "-", "")
+	k = strings.ReplaceAll(k, "_", "")
+	return k
 }

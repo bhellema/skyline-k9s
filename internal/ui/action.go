@@ -218,3 +218,34 @@ func (a *KeyActions) Hints() model.MenuHints {
 
 	return hh
 }
+
+// SharedHints returns a collection of shared hints.
+func (a *KeyActions) SharedHints() model.MenuHints {
+	a.mx.RLock()
+	defer a.mx.RUnlock()
+
+	kk := make([]tcell.Key, 0, len(a.actions))
+	for k := range a.actions {
+		if a.actions[k].Opts.Shared && a.actions[k].Opts.Visible {
+			kk = append(kk, k)
+		}
+	}
+	slices.Sort(kk)
+
+	hh := make(model.MenuHints, 0, len(kk))
+	for _, k := range kk {
+		if name, ok := tcell.KeyNames[k]; ok {
+			hh = append(hh,
+				model.MenuHint{
+					Mnemonic:    name,
+					Description: a.actions[k].Description,
+					Visible:     true,
+				},
+			)
+		} else {
+			slog.Error("Unable to locate key name", slogs.Key, k)
+		}
+	}
+
+	return hh
+}
