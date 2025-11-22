@@ -246,6 +246,11 @@ func (a *App) contextNames() ([]string, error) {
 }
 
 func (a *App) keyboard(evt *tcell.EventKey) *tcell.EventKey {
+	// Check for Shift+F1 (Sky Use command)
+	if evt.Key() == tcell.KeyF1 && evt.Modifiers()&tcell.ModShift != 0 {
+		return a.skyUseCmd(evt)
+	}
+
 	if k, ok := a.HasAction(ui.AsKey(evt)); ok && !a.Content.IsTopDialog() {
 		return k.Action(evt)
 	}
@@ -866,6 +871,17 @@ func (a *App) skyPipelinesCmd(evt *tcell.EventKey) *tcell.EventKey {
 	}
 
 	a.Prompt().Deactivate()
+	return nil
+}
+
+func (a *App) skyUseCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if a.Prompt().InCmdMode() {
+		return evt
+	}
+
+	// Show the dialog
+	ShowSkyUseDialog(a)
+
 	return nil
 }
 
