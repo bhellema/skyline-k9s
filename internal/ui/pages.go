@@ -36,7 +36,10 @@ func (p *Pages) IsTopDialog() bool {
 	case *tview.ModalForm, *ModalList:
 		return true
 	default:
-		return false
+		// Check if it's a SkyUseModal from the view package
+		// We check the type name to avoid circular imports
+		typeName := fmt.Sprintf("%T", pa)
+		return typeName == "*view.SkyUseModal"
 	}
 }
 

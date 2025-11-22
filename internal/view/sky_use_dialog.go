@@ -14,10 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/derailed/k9s/internal/client"
-	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/slogs"
-	"github.com/derailed/k9s/internal/view/cmd"
 	"github.com/derailed/tcell/v2"
 	"github.com/derailed/tview"
 )
@@ -233,8 +230,22 @@ func ShowSkyUseDialog(app *App) {
 				app.SetFocus(list)
 			}
 			return nil
+		case tcell.KeyRune:
+			// Allow all runes (letters, numbers, special chars) to be typed
+			// This includes '-', '_', etc.
+			return evt
+		case tcell.KeyBackspace, tcell.KeyBackspace2, tcell.KeyDelete:
+			// Allow deletion
+			return evt
+		case tcell.KeyLeft, tcell.KeyRight, tcell.KeyHome, tcell.KeyEnd:
+			// Allow cursor movement
+			return evt
+		case tcell.KeyCtrlA, tcell.KeyCtrlE, tcell.KeyCtrlU, tcell.KeyCtrlK:
+			// Allow common editing shortcuts
+			return evt
 		}
-		return evt
+		// Block all other keys
+		return nil
 	})
 
 	// Handle list events
@@ -249,12 +260,21 @@ func ShowSkyUseDialog(app *App) {
 				app.SetFocus(input)
 				return nil
 			}
+			// Otherwise allow up navigation in list
+			return evt
+		case tcell.KeyDown:
+			// Allow down navigation in list
+			return evt
+		case tcell.KeyEnter:
+			// Allow selection
+			return evt
 		case tcell.KeyTab:
 			// Move focus to input
 			app.SetFocus(input)
 			return nil
 		}
-		return evt
+		// Block all other keys
+		return nil
 	})
 
 	// Build layout
@@ -308,9 +328,71 @@ func ShowSkyUseDialog(app *App) {
 		AddItem(nil, 0, 1, false), dialogHeight, 0, true)
 	centered.AddItem(nil, 0, 1, false)
 
+	// Wrap in a custom modal that will be recognized by IsTopDialog()
+	modal := NewSkyUseModal(centered, input, list)
+
 	// Show the dialog
-	app.Content.Pages.AddPage(skyUseDialogKey, centered, true, true)
+	app.Content.Pages.AddPage(skyUseDialogKey, modal, true, true)
 	app.SetFocus(input)
+}
+
+// SkyUseModal is a custom modal that wraps our sky use dialog
+// It mimics ui.ModalList so it's recognized by IsTopDialog()
+type SkyUseModal struct {
+	*tview.Box
+	content *tview.Flex
+	input   *tview.InputField
+	list    *tview.List
+}
+
+func NewSkyUseModal(content *tview.Flex, input *tview.InputField, list *tview.List) *SkyUseModal {
+	return &SkyUseModal{
+		Box:     tview.NewBox(),
+		content: content,
+		input:   input,
+		list:    list,
+	}
+}
+
+func (m *SkyUseModal) Draw(screen tcell.Screen) {
+	// Get screen dimensions
+	screenWidth, screenHeight := screen.Size()
+
+	// Set the modal to use the full screen (the content Flex handles centering)
+	m.SetRect(0, 0, screenWidth, screenHeight)
+
+	// Set content rect to full screen as well
+	m.content.SetRect(0, 0, screenWidth, screenHeight)
+
+	// Draw the content
+	m.content.Draw(screen)
+}
+
+func (m *SkyUseModal) Focus(delegate func(p tview.Primitive)) {
+	delegate(m.input)
+}
+
+func (m *SkyUseModal) HasFocus() bool {
+	return m.input.HasFocus() || m.list.HasFocus()
+}
+
+func (m *SkyUseModal) MouseHandler() func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
+	return m.WrapMouseHandler(func(action tview.MouseAction, event *tcell.EventMouse, setFocus func(p tview.Primitive)) (consumed bool, capture tview.Primitive) {
+		consumed, capture = m.content.MouseHandler()(action, event, setFocus)
+		if !consumed && action == tview.MouseLeftClick && m.InRect(event.Position()) {
+			setFocus(m)
+			consumed = true
+		}
+		return
+	})
+}
+
+func (m *SkyUseModal) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
+	return m.WrapInputHandler(func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
+		if handler := m.content.InputHandler(); handler != nil {
+			handler(event, setFocus)
+		}
+	})
 }
 
 func dismissSkyUseDialog(app *App) {
@@ -387,6 +469,23 @@ func switchContextAndNamespace(app *App, cluster, namespace string) {
 		})
 		return
 	}
+	slog.Info("Kubectl namespace set complete", "output", string(output))
+
+	// Verify the namespace was set correctly
+	cmd3 := exec.CommandContext(ctx, "kubectl", "config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.namespace}")
+	verifyOutput, err := cmd3.CombinedOutput()
+	if err != nil {
+		slog.Warn("Failed to verify namespace", slogs.Error, err)
+	} else {
+		actualNS := strings.TrimSpace(string(verifyOutput))
+		slog.Info("Verified current context namespace", "expected", namespace, "actual", actualNS)
+		if actualNS != namespace {
+			slog.Error("Namespace mismatch after kubectl set", "expected", namespace, "actual", actualNS)
+		}
+	}
+
+	// Add a small delay to ensure kubectl config is flushed to disk
+	time.Sleep(100 * time.Millisecond)
 
 	// Now update K9s internal state to match
 	app.QueueUpdateDraw(func() {
@@ -397,52 +496,73 @@ func switchContextAndNamespace(app *App, cluster, namespace string) {
 			app.Content.Top().Stop()
 		}
 
-		// Get context accessor
-		res, err := dao.AccessorFor(app.factory, client.CtGVR)
-		if err != nil {
-			slog.Error("Failed to get context accessor", slogs.Error, err)
-			app.Flash().Errf("Failed to reload: %s", err)
+		// IMPORTANT: Set the namespace in K9s config FIRST before switchContext
+		// This ensures switchContext uses the correct namespace when reloading
+		slog.Info("Setting active namespace in K9s config (BEFORE switchContext)", "namespace", namespace)
+		if err := app.Config.SetActiveNamespace(namespace); err != nil {
+			slog.Error("Failed to set active namespace in config", slogs.Error, err)
+			app.Flash().Errf("Failed to set namespace: %s", err)
 			return
 		}
 
-		switcher, ok := res.(dao.Switchable)
-		if !ok {
-			app.Flash().Err(fmt.Errorf("expecting a switchable resource"))
-			return
-		}
+		// Verify it was set
+		verifyNS := app.Config.ActiveNamespace()
+		slog.Info("K9s config active namespace verified", "namespace", verifyNS, "expected", namespace)
 
 		app.Config.K9s.ToggleContextSwitch(true)
 		defer app.Config.K9s.ToggleContextSwitch(false)
 
-		// Tell K9s about the context switch (kubectl already did it)
-		slog.Info("Notifying K9s of context switch", "cluster", cluster)
-		if err := switcher.Switch(cluster); err != nil {
-			slog.Error("Failed to notify K9s of context switch", slogs.Error, err)
-			// Continue anyway since kubectl already switched
-		}
-
-		// Update K9s config to match kubectl config
-		slog.Info("Updating K9s config", "namespace", namespace)
-		if err := app.Config.SetActiveNamespace(namespace); err != nil {
-			slog.Error("Failed to set active namespace in config", slogs.Error, err)
-		}
-
-		// Create interpreter for the context (kubectl already set namespace)
-		interpreter := cmd.NewInterpreter("ctx " + cluster)
-
-		// Reload K9s with the new context
-		slog.Info("Calling switchContext to reload views", "cluster", cluster)
-		if err := app.switchContext(interpreter, true); err != nil {
-			slog.Error("switchContext failed", slogs.Error, err)
-			app.Flash().Errf("Failed to reload context: %s", err)
+		// CRITICAL: Use the client's SwitchContext to reload the kubeconfig
+		// This should pick up the namespace we set via kubectl
+		slog.Info("Switching context via client to reload kubeconfig")
+		if err := app.factory.Client().SwitchContext(cluster); err != nil {
+			slog.Error("Failed to switch context via client", slogs.Error, err)
+			app.Flash().Errf("Failed to switch context: %s", err)
 			return
 		}
 
-		// Ensure factory is using correct namespace
-		slog.Info("Setting factory namespace", "namespace", namespace)
+		// Verify factory namespace is correct after switch
+		factoryNS := app.factory.Client().ActiveNamespace()
+		slog.Info("Factory namespace after client switch", "namespace", factoryNS, "expected", namespace)
+
+		// Force set factory namespace (always, to be safe)
+		slog.Info("Force setting factory namespace", "namespace", namespace)
 		if err := app.factory.SetActiveNS(namespace); err != nil {
 			slog.Error("Failed to set factory namespace", slogs.Error, err)
+			app.Flash().Errf("Failed to set namespace: %s", err)
+			return
 		}
+
+		// Re-init factory with the correct namespace (terminate and restart)
+		slog.Info("Re-initializing factory", "namespace", namespace)
+		app.factory.Terminate()
+		app.factory.Start(namespace)
+
+		// Verify after factory restart
+		factoryNS = app.factory.Client().ActiveNamespace()
+		slog.Info("Factory namespace after restart", "namespace", factoryNS, "expected", namespace)
+
+		// Reload the current view (use just the GVR, not the full view string)
+		// The full view might contain the old namespace, so we extract just the resource type
+		currentView := app.Config.ActiveView()
+		slog.Info("Current view string", "view", currentView)
+
+		// Extract just the GVR part (before any space/namespace)
+		viewParts := strings.Fields(currentView)
+		gvr := currentView
+		if len(viewParts) > 0 {
+			gvr = viewParts[0]
+		}
+
+		slog.Info("Reloading view", "gvr", gvr, "namespace", namespace)
+		app.gotoResource(gvr, "", true, true)
+
+		// Reset cluster model
+		app.clusterModel.Reset(app.factory)
+
+		// Final verification
+		finalNS := app.factory.Client().ActiveNamespace()
+		slog.Info("Final factory namespace", "namespace", finalNS, "expected", namespace)
 
 		// Save config
 		if err := app.Config.Save(true); err != nil {
