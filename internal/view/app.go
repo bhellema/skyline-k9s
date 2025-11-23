@@ -267,6 +267,7 @@ func (a *App) bindKeys() {
 		tcell.KeyCtrlG:     ui.NewSharedKeyAction("ToggleCrumbs", a.toggleCrumbsCmd, false),
 		tcell.KeyF1:        ui.NewSharedKeyAction("Sky Grafana Red", a.openGrafanaCmd, true),
 		tcell.KeyF2:        ui.NewSharedKeyAction("Sky Pipelines", a.skyPipelinesCmd, true),
+		tcell.KeyF3:        ui.NewSharedKeyAction("Sky Thread Dump", a.skyThreadDumpCmd, true),
 		ui.KeyHelp:         ui.NewSharedKeyAction("Help", a.helpCmd, false),
 		ui.KeyLeftBracket:  ui.NewSharedKeyAction("Go Back", a.previousCommand, false),
 		ui.KeyRightBracket: ui.NewSharedKeyAction("Go Forward", a.nextCommand, false),
@@ -877,14 +878,62 @@ func (a *App) skyPipelinesCmd(evt *tcell.EventKey) *tcell.EventKey {
 	return nil
 }
 
-func (a *App) skyUseCmd(evt *tcell.EventKey) *tcell.EventKey {
+func (a *App) skyThreadDumpCmd(evt *tcell.EventKey) *tcell.EventKey {
 	if a.Prompt().InCmdMode() {
 		return evt
 	}
 
-	// Show the dialog
-	ShowSkyUseDialog(a)
+	// Get the currently selected pod from the active view
+	top := a.Content.Top()
+	if top == nil {
+		a.Flash().Warn("No active view")
+		return nil
+	}
 
+	// Check if it's a table viewer
+	tv, ok := top.(TableViewer)
+	if !ok {
+		a.Flash().Warn("Current view does not support selection")
+		return nil
+	}
+
+	// Get the table from the current view
+	table := tv.GetTable()
+	if table == nil {
+		a.Flash().Warn("Could not access table")
+		return nil
+	}
+
+	// Get the currently selected item (path)
+	path := table.GetSelectedItem()
+	if path == "" {
+		a.Flash().Warn("No pod selected")
+		return nil
+	}
+
+	// Extract pod name from path (format could be "namespace/podname" or just "podname")
+	podName := path
+	if idx := strings.LastIndex(path, "/"); idx != -1 {
+		podName = path[idx+1:]
+	}
+
+	if podName == "" {
+		a.Flash().Warn("Could not determine pod name")
+		return nil
+	}
+
+	slog.Info("Thread dump requested for selected pod", "pod", podName, "path", path)
+
+	// Show the save location dialog and proceed with thread dump
+	ShowThreadDumpSaveDialog(a, podName)
+	return nil
+}
+
+func (a *App) skyUseCmd(evt *tcell.EventKey) *tcell.EventKey {
+	if a.Prompt().InCmdMode() {
+		return evt
+	}
+	ShowSkyUseDialog(a)
 	return nil
 }
 
