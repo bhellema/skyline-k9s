@@ -146,6 +146,9 @@ func (a *App) Init(version string, _ int) error {
 	}
 	a.ReloadStyles()
 
+	// Check sky configuration on startup
+	go a.checkSkyConfiguration()
+
 	return nil
 }
 
@@ -915,4 +918,77 @@ func openBrowser(url string) error {
 	}
 
 	return cmd.Start()
+}
+
+// checkSkyConfiguration checks if sky is properly configured on startup
+func (a *App) checkSkyConfiguration() {
+	// Wait a bit for the app to fully initialize
+	time.Sleep(500 * time.Millisecond)
+
+	slog.Info("Checking sky configuration on startup")
+
+	cluster, namespace, service, err := fetchSkyShow()
+	if err != nil {
+		slog.Warn("Sky show command failed", slogs.Error, err)
+		a.showSkyUseDialogOnStartup("Sky not configured. Please set up your environment.")
+		return
+	}
+
+	if cluster == "" || namespace == "" || service == "" {
+		slog.Warn("Sky show returned incomplete configuration",
+			"cluster", cluster,
+			"namespace", namespace,
+			"service", service)
+		a.showSkyUseDialogOnStartup("Incomplete sky configuration. Please set up your environment.")
+		return
+	}
+
+	slog.Info("Sky configuration valid",
+		"cluster", cluster,
+		"namespace", namespace,
+		"service", service)
+}
+
+// showSkyUseDialogOnStartup shows the Sky Use dialog with a message
+func (a *App) showSkyUseDialogOnStartup(message string) {
+	a.QueueUpdateDraw(func() {
+		a.Flash().Warn(message)
+		ShowSkyUseDialog(a)
+	})
+}
+
+// fetchSkyShow executes "sky show" and returns cluster, namespace, service
+func fetchSkyShow() (cluster, namespace, service string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	slog.Info("Executing sky show command")
+	cmd := exec.CommandContext(ctx, "sky", "show")
+	out, err := cmd.CombinedOutput()
+	outStr := strings.TrimSpace(string(out))
+
+	if err != nil {
+		slog.Error("sky show command failed", slogs.Error, err, "output", outStr)
+		return "", "", "", fmt.Errorf("sky show failed: %w", err)
+	}
+
+	slog.Info("sky show output", "output", outStr)
+
+	// Parse the output: "cluster namespace service"
+	parts := strings.Fields(outStr)
+	if len(parts) < 3 {
+		slog.Warn("sky show returned insufficient values", "parts", parts, "count", len(parts))
+		return "", "", "", fmt.Errorf("sky show returned %d values, expected 3", len(parts))
+	}
+
+	cluster = parts[0]
+	namespace = parts[1]
+	service = parts[2]
+
+	slog.Info("Parsed sky show output",
+		"cluster", cluster,
+		"namespace", namespace,
+		"service", service)
+
+	return cluster, namespace, service, nil
 }

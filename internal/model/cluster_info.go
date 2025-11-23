@@ -94,15 +94,16 @@ func (c *ClusterMeta) Deltas(n *ClusterMeta) bool {
 
 // ClusterInfo models cluster metadata.
 type ClusterInfo struct {
-	cluster   *Cluster
-	factory   dao.Factory
-	data      *ClusterMeta
-	version   string
-	cfg       *config.K9s
-	listeners []ClusterInfoListener
-	cache     *cache.LRUExpireCache
-	mx        sync.RWMutex
-	skyInfo   *skyCustomerInfo
+	cluster            *Cluster
+	factory            dao.Factory
+	data               *ClusterMeta
+	version            string
+	cfg                *config.K9s
+	listeners          []ClusterInfoListener
+	cache              *cache.LRUExpireCache
+	mx                 sync.RWMutex
+	skyInfo            *skyCustomerInfo
+	skyFetchInProgress bool
 }
 
 // NewClusterInfo returns a new instance.
@@ -144,6 +145,7 @@ func (c *ClusterInfo) Reset(f dao.Factory) {
 	c.mx.Lock()
 	c.cluster, c.data = NewCluster(f), NewClusterMeta()
 	c.skyInfo = nil
+	c.skyFetchInProgress = false // Reset fetch flag
 	c.mx.Unlock()
 
 	c.Refresh()
@@ -165,15 +167,38 @@ func (c *ClusterInfo) Refresh() {
 		}
 	}
 
-	// Fetch sky customer info asynchronously to avoid blocking UI
-	go c.fetchSkyCustomerInfoAsync()
+	// Only fetch sky customer info once - it doesn't change during runtime
+	c.mx.Lock()
+	hasSkyInfo := c.skyInfo != nil
+	fetchInProgress := c.skyFetchInProgress
+	c.mx.Unlock()
 
-	// Use cached sky info if available (from previous fetch)
-	if sky := c.getSkyInfoFromCache(); sky != nil {
-		data.Program = sky.Program
-		data.EnvironmentType = sky.EnvironmentType
-		data.ReleaseID = sky.ReleaseID
-		data.Sandbox = sky.Sandbox
+	// Only fetch if we don't have sky info yet and no fetch is in progress
+	if !hasSkyInfo && !fetchInProgress {
+		c.mx.Lock()
+		c.skyFetchInProgress = true
+		c.mx.Unlock()
+
+		slog.Info("Initiating sky inspect cm fetch (no data yet)")
+		// Fetch sky customer info asynchronously to avoid blocking UI
+		go c.fetchSkyCustomerInfoAsync()
+	} else {
+		if hasSkyInfo {
+			slog.Debug("Skipping sky inspect cm fetch (already have data)")
+			// Use existing sky info
+			c.mx.RLock()
+			existingSky := c.skyInfo
+			c.mx.RUnlock()
+
+			if existingSky != nil {
+				data.Program = existingSky.Program
+				data.EnvironmentType = existingSky.EnvironmentType
+				data.ReleaseID = existingSky.ReleaseID
+				data.Sandbox = existingSky.Sandbox
+			}
+		} else {
+			slog.Debug("Skipping sky inspect cm fetch (fetch already in progress)")
+		}
 	}
 
 	data.K9sVer = c.version
@@ -237,13 +262,46 @@ func (c *ClusterInfo) fireNoMetaChanged(data *ClusterMeta) {
 func (c *ClusterInfo) fetchSkyCustomerInfoAsync() {
 	defer func(t time.Time) {
 		slog.Debug("Sky customer info fetch time", slogs.Elapsed, time.Since(t))
+		// Reset fetch flag when done
+		c.mx.Lock()
+		c.skyFetchInProgress = false
+		c.mx.Unlock()
 	}(time.Now())
 
+	slog.Info("Starting sky inspect cm fetch")
 	info, err := fetchSkyCustomerInfo()
 	if err != nil {
-		slog.Debug("Sky customer info unavailable", slogs.Error, err)
+		slog.Warn("Sky customer info fetch failed", slogs.Error, err)
+
+		// Extract error message to display
+		errMsg := err.Error()
+		// Truncate if too long for display
+		if len(errMsg) > 50 {
+			errMsg = errMsg[:47] + "..."
+		}
+
+		// Set error values to show the actual error
+		errorInfo := &skyCustomerInfo{
+			Program:         "Error: " + errMsg,
+			EnvironmentType: "Error: " + errMsg,
+			ReleaseID:       "Error: " + errMsg,
+			Sandbox:         "Error: " + errMsg,
+		}
+
+		c.mx.Lock()
+		c.skyInfo = errorInfo
+		c.mx.Unlock()
+
+		// Update cluster data with error info
+		c.updateWithSkyInfo(errorInfo)
 		return
 	}
+
+	slog.Info("Sky customer info fetched successfully",
+		"program", info.Program,
+		"environmentType", info.EnvironmentType,
+		"releaseID", info.ReleaseID,
+		"sandbox", info.Sandbox)
 
 	c.mx.Lock()
 	c.skyInfo = info
@@ -251,29 +309,37 @@ func (c *ClusterInfo) fetchSkyCustomerInfoAsync() {
 
 	// Update cluster data with sky info
 	c.updateWithSkyInfo(info)
-}
-
-// getSkyInfoFromCache returns cached sky info without fetching.
-func (c *ClusterInfo) getSkyInfoFromCache() *skyCustomerInfo {
-	c.mx.RLock()
-	defer c.mx.RUnlock()
-	return c.skyInfo
+	slog.Info("Sky customer info updated in cluster metadata")
 }
 
 // updateWithSkyInfo updates the cluster metadata with sky customer info.
 func (c *ClusterInfo) updateWithSkyInfo(sky *skyCustomerInfo) {
+	slog.Info("Updating cluster metadata with sky info",
+		"program", sky.Program,
+		"environmentType", sky.EnvironmentType,
+		"releaseID", sky.ReleaseID,
+		"sandbox", sky.Sandbox)
+
 	c.mx.Lock()
 	if c.data != nil {
 		c.data.Program = sky.Program
 		c.data.EnvironmentType = sky.EnvironmentType
 		c.data.ReleaseID = sky.ReleaseID
 		c.data.Sandbox = sky.Sandbox
+		slog.Info("Cluster metadata updated",
+			"program", c.data.Program,
+			"environmentType", c.data.EnvironmentType,
+			"releaseID", c.data.ReleaseID,
+			"sandbox", c.data.Sandbox)
+	} else {
+		slog.Warn("Cluster data is nil, cannot update with sky info")
 	}
 	data := c.data
 	c.mx.Unlock()
 
 	// Notify listeners that data was updated
 	if data != nil {
+		slog.Info("Firing cluster info update to listeners", "listener_count", len(c.listeners))
 		c.fireNoMetaChanged(data)
 	}
 }
@@ -324,53 +390,112 @@ type skyCustomerInfo struct {
 }
 
 func fetchSkyCustomerInfo() (*skyCustomerInfo, error) {
+	slog.Info("Executing sky inspect cm command", "timeout", skyInspectTimeout)
 	ctx, cancel := context.WithTimeout(context.Background(), skyInspectTimeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, skyInspectBin, "inspect", skyInspectResource)
-	out, err := cmd.Output()
+
+	// Capture both stdout and stderr
+	out, err := cmd.CombinedOutput()
+	outStr := string(out)
+
 	if err != nil {
-		return nil, err
+		// Try to extract a meaningful error message from the output
+		errMsg := extractErrorMessage(outStr)
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+
+		// Log both the error and the output (which may contain stderr)
+		slog.Error("sky inspect cm command failed",
+			slogs.Error, err,
+			"output", outStr,
+			"extracted_error", errMsg)
+
+		return nil, errors.New(errMsg)
 	}
+
+	slog.Info("sky inspect cm command output", "output", outStr)
 
 	info := parseSkyCustomerInfo(out)
 	if info == nil {
+		slog.Error("Failed to parse sky inspect cm output", "raw_output", outStr)
 		return nil, errors.New("malformed sky inspect cm output")
 	}
+
+	slog.Info("Parsed sky customer info",
+		"program", info.Program,
+		"environmentType", info.EnvironmentType,
+		"releaseID", info.ReleaseID,
+		"sandbox", info.Sandbox)
 
 	return info, nil
 }
 
+// extractErrorMessage tries to extract a clean error message from sky command output
+func extractErrorMessage(output string) string {
+	// Look for lines starting with "Error:"
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Error:") {
+			// Remove "Error:" prefix and return the message
+			return strings.TrimSpace(strings.TrimPrefix(line, "Error:"))
+		}
+	}
+	return ""
+}
+
 func parseSkyCustomerInfo(out []byte) *skyCustomerInfo {
+	slog.Info("Parsing sky inspect cm output", "length", len(out))
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	values := make(map[string]string)
+	lineCount := 0
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		lineCount++
 		if line == "" {
 			continue
 		}
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
+			slog.Debug("Skipping malformed line", "line", line)
 			continue
 		}
 		key := normalizeSkyKey(parts[0])
 		value := strings.TrimSpace(parts[1])
 		if key != "" {
+			slog.Debug("Parsed sky key-value", "key", key, "value", value, "original_key", parts[0])
 			values[key] = value
 		}
 	}
 
+	slog.Info("Sky inspect cm parsing complete",
+		"total_lines", lineCount,
+		"parsed_values", len(values),
+		"values", values)
+
 	if len(values) == 0 {
+		slog.Warn("No values parsed from sky inspect cm output")
 		return nil
 	}
 
-	return &skyCustomerInfo{
+	info := &skyCustomerInfo{
 		Program:         values["program"],
 		EnvironmentType: values["environmenttype"],
 		ReleaseID:       values["releaseid"],
 		Sandbox:         values["sandbox"],
 	}
+
+	slog.Info("Created skyCustomerInfo struct",
+		"program", info.Program,
+		"environmentType", info.EnvironmentType,
+		"releaseID", info.ReleaseID,
+		"sandbox", info.Sandbox)
+
+	return info
 }
 
 func normalizeSkyKey(key string) string {

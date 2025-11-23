@@ -429,10 +429,10 @@ func handleSkyUse(app *App, text string) {
 	app.Flash().Infof("Switching to cluster=%s, namespace=%s...", cluster, namespace)
 
 	// Switch context and namespace
-	go switchContextAndNamespace(app, cluster, namespace)
+	go switchContextAndNamespace(app, cluster, namespace, service)
 }
 
-func switchContextAndNamespace(app *App, cluster, namespace string) {
+func switchContextAndNamespace(app *App, cluster, namespace, service string) {
 	// Run kubectl commands to atomically set both context and namespace
 	// This avoids the race condition where K9s tries to access default namespace
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -440,7 +440,8 @@ func switchContextAndNamespace(app *App, cluster, namespace string) {
 
 	slog.Info("Starting context/namespace switch via kubectl",
 		"cluster", cluster,
-		"namespace", namespace)
+		"namespace", namespace,
+		"service", service)
 
 	// First, use kubectl to switch context
 	slog.Info("Switching context via kubectl", "cluster", cluster)
@@ -569,11 +570,39 @@ func switchContextAndNamespace(app *App, cluster, namespace string) {
 			slog.Error("Failed to save config", slogs.Error, err)
 		}
 
+		// Call sky use command to complete the environment switch
+		slog.Info("Calling sky use command", "cluster", cluster, "namespace", namespace, "service", service)
+		go executeSkyUseCommand(cluster, namespace, service)
+
 		slog.Info("Context and namespace switch completed successfully",
 			"cluster", cluster,
 			"namespace", namespace)
 		app.Flash().Infof("Successfully switched to %s::%s", cluster, namespace)
 	})
+}
+
+// executeSkyUseCommand runs the sky use command in the background
+func executeSkyUseCommand(cluster, namespace, service string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sky", "use", cluster, namespace, service)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		slog.Error("Failed to execute sky use command",
+			slogs.Error, err,
+			"output", string(output),
+			"cluster", cluster,
+			"namespace", namespace,
+			"service", service)
+		return
+	}
+
+	slog.Info("Sky use command executed successfully",
+		"output", string(output),
+		"cluster", cluster,
+		"namespace", namespace,
+		"service", service)
 }
 
 // parseSkyUseCommand parses a sky use command string.
