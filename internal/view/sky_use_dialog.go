@@ -558,7 +558,10 @@ func switchContextAndNamespace(app *App, cluster, namespace, service string) {
 		slog.Info("Reloading view", "gvr", gvr, "namespace", namespace)
 		app.gotoResource(gvr, "", true, true)
 
-		// Reset cluster model
+		// Show flash message that Skyline details are loading
+		app.Flash().Info("Loading Skyline environment details...")
+
+		// Reset cluster model (this will trigger sky inspect cm fetch)
 		app.clusterModel.Reset(app.factory)
 
 		// Final verification

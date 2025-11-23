@@ -62,10 +62,10 @@ func NewClusterMeta() *ClusterMeta {
 		Context:         client.NA,
 		Cluster:         client.NA,
 		User:            client.NA,
-		Program:         client.NA,
-		EnvironmentType: client.NA,
-		ReleaseID:       client.NA,
-		Sandbox:         client.NA,
+		Program:         "",
+		EnvironmentType: "",
+		ReleaseID:       "",
+		Sandbox:         "",
 		K9sVer:          client.NA,
 		K8sVer:          client.NA,
 		Cpu:             0,
@@ -171,6 +171,7 @@ func (c *ClusterInfo) Refresh() {
 	c.mx.Lock()
 	hasSkyInfo := c.skyInfo != nil
 	fetchInProgress := c.skyFetchInProgress
+	existingSky := c.skyInfo
 	c.mx.Unlock()
 
 	// Only fetch if we don't have sky info yet and no fetch is in progress
@@ -179,26 +180,21 @@ func (c *ClusterInfo) Refresh() {
 		c.skyFetchInProgress = true
 		c.mx.Unlock()
 
+		// Leave data.Program, data.EnvironmentType, etc. empty (they default to "")
+		// The async fetch will update them when complete
 		slog.Info("Initiating sky inspect cm fetch (no data yet)")
 		// Fetch sky customer info asynchronously to avoid blocking UI
 		go c.fetchSkyCustomerInfoAsync()
+	} else if hasSkyInfo && existingSky != nil {
+		// We have completed sky info - use it to populate the data
+		slog.Debug("Using cached sky info for refresh")
+		data.Program = existingSky.Program
+		data.EnvironmentType = existingSky.EnvironmentType
+		data.ReleaseID = existingSky.ReleaseID
+		data.Sandbox = existingSky.Sandbox
 	} else {
-		if hasSkyInfo {
-			slog.Debug("Skipping sky inspect cm fetch (already have data)")
-			// Use existing sky info
-			c.mx.RLock()
-			existingSky := c.skyInfo
-			c.mx.RUnlock()
-
-			if existingSky != nil {
-				data.Program = existingSky.Program
-				data.EnvironmentType = existingSky.EnvironmentType
-				data.ReleaseID = existingSky.ReleaseID
-				data.Sandbox = existingSky.Sandbox
-			}
-		} else {
-			slog.Debug("Skipping sky inspect cm fetch (fetch already in progress)")
-		}
+		// Fetch is in progress - leave fields empty until it completes
+		slog.Debug("Sky info fetch in progress, leaving fields empty")
 	}
 
 	data.K9sVer = c.version
@@ -269,6 +265,16 @@ func (c *ClusterInfo) fetchSkyCustomerInfoAsync() {
 	}(time.Now())
 
 	slog.Info("Starting sky inspect cm fetch")
+
+	// Immediately show "Loading..." in the UI
+	loadingInfo := &skyCustomerInfo{
+		Program:         "Loading...",
+		EnvironmentType: "Loading...",
+		ReleaseID:       "Loading...",
+		Sandbox:         "Loading...",
+	}
+	c.updateWithSkyInfo(loadingInfo)
+
 	info, err := fetchSkyCustomerInfo()
 	if err != nil {
 		slog.Warn("Sky customer info fetch failed", slogs.Error, err)
@@ -391,46 +397,79 @@ type skyCustomerInfo struct {
 
 func fetchSkyCustomerInfo() (*skyCustomerInfo, error) {
 	slog.Info("Executing sky inspect cm command", "timeout", skyInspectTimeout)
-	ctx, cancel := context.WithTimeout(context.Background(), skyInspectTimeout)
-	defer cancel()
 
-	cmd := exec.CommandContext(ctx, skyInspectBin, "inspect", skyInspectResource)
+	var lastErr error
+	maxAttempts := 2
 
-	// Capture both stdout and stderr
-	out, err := cmd.CombinedOutput()
-	outStr := string(out)
-
-	if err != nil {
-		// Try to extract a meaningful error message from the output
-		errMsg := extractErrorMessage(outStr)
-		if errMsg == "" {
-			errMsg = err.Error()
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			slog.Info("Retrying sky inspect cm command", "attempt", attempt, "max_attempts", maxAttempts)
+			// Small delay between retries
+			time.Sleep(500 * time.Millisecond)
 		}
 
-		// Log both the error and the output (which may contain stderr)
-		slog.Error("sky inspect cm command failed",
-			slogs.Error, err,
-			"output", outStr,
-			"extracted_error", errMsg)
+		ctx, cancel := context.WithTimeout(context.Background(), skyInspectTimeout)
+		cmd := exec.CommandContext(ctx, skyInspectBin, "inspect", skyInspectResource)
 
-		return nil, errors.New(errMsg)
+		// Capture both stdout and stderr
+		out, err := cmd.CombinedOutput()
+		outStr := string(out)
+		cancel() // Cancel context after command completes
+
+		if err != nil {
+			// Try to extract a meaningful error message from the output
+			errMsg := extractErrorMessage(outStr)
+			if errMsg == "" {
+				errMsg = err.Error()
+			}
+
+			// Log both the error and the output (which may contain stderr)
+			slog.Error("sky inspect cm command failed",
+				slogs.Error, err,
+				"attempt", attempt,
+				"max_attempts", maxAttempts,
+				"output", outStr,
+				"extracted_error", errMsg)
+
+			lastErr = errors.New(errMsg)
+
+			// If this isn't the last attempt, continue to retry
+			if attempt < maxAttempts {
+				continue
+			}
+
+			// Last attempt failed, return the error
+			return nil, lastErr
+		}
+
+		slog.Info("sky inspect cm command output", "output", outStr, "attempt", attempt)
+
+		info := parseSkyCustomerInfo(out)
+		if info == nil {
+			slog.Error("Failed to parse sky inspect cm output", "raw_output", outStr, "attempt", attempt)
+			lastErr = errors.New("malformed sky inspect cm output")
+
+			// If this isn't the last attempt, continue to retry
+			if attempt < maxAttempts {
+				continue
+			}
+
+			// Last attempt failed, return the error
+			return nil, lastErr
+		}
+
+		slog.Info("Parsed sky customer info",
+			"program", info.Program,
+			"environmentType", info.EnvironmentType,
+			"releaseID", info.ReleaseID,
+			"sandbox", info.Sandbox,
+			"attempt", attempt)
+
+		return info, nil
 	}
 
-	slog.Info("sky inspect cm command output", "output", outStr)
-
-	info := parseSkyCustomerInfo(out)
-	if info == nil {
-		slog.Error("Failed to parse sky inspect cm output", "raw_output", outStr)
-		return nil, errors.New("malformed sky inspect cm output")
-	}
-
-	slog.Info("Parsed sky customer info",
-		"program", info.Program,
-		"environmentType", info.EnvironmentType,
-		"releaseID", info.ReleaseID,
-		"sandbox", info.Sandbox)
-
-	return info, nil
+	// Should not reach here, but return last error just in case
+	return nil, lastErr
 }
 
 // extractErrorMessage tries to extract a clean error message from sky command output

@@ -828,7 +828,16 @@ func (a *App) globalHints() model.MenuHints {
 		return nil
 	}
 
-	return a.GetActions().SharedHints()
+	hints := a.GetActions().SharedHints()
+
+	// Manually add Shift+F1 hint since it's handled specially in keyboard()
+	hints = append(hints, model.MenuHint{
+		Mnemonic:    "Shift-F1",
+		Description: "Sky Use",
+		Visible:     true, // Must be visible to show in menu
+	})
+
+	return hints
 }
 
 func (a *App) openGrafanaCmd(evt *tcell.EventKey) *tcell.EventKey {
