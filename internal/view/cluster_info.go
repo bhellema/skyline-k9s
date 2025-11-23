@@ -5,13 +5,10 @@ package view
 
 import (
 	"fmt"
-	"log/slog"
 
-	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/k9s/internal/model"
 	"github.com/derailed/k9s/internal/render"
-	"github.com/derailed/k9s/internal/slogs"
 	"github.com/derailed/k9s/internal/ui"
 	"github.com/derailed/tcell/v2"
 	"github.com/derailed/tview"
@@ -51,19 +48,6 @@ func (c *ClusterInfo) StylesChanged(s *config.Styles) {
 	c.updateStyle()
 }
 
-func (c *ClusterInfo) hasMetrics() bool {
-	mx := c.app.Conn().HasMetrics()
-	if mx {
-		auth, err := c.app.Conn().CanI("", client.NmxGVR, "", client.ListAccess)
-		if err != nil {
-			slog.Warn("No nodes metrics access", slogs.Error, err)
-		}
-		mx = auth
-	}
-
-	return mx
-}
-
 func (c *ClusterInfo) layout() {
 	for row, section := range []string{
 		"Context",
@@ -71,8 +55,6 @@ func (c *ClusterInfo) layout() {
 		"User",
 		"K9s Rev",
 		"K8s Rev",
-		"CPU",
-		"MEM",
 		"Program",
 		"Env Type",
 		"Release ID",
@@ -113,14 +95,6 @@ func (c *ClusterInfo) ClusterInfoUpdated(data *model.ClusterMeta) {
 	c.ClusterInfoChanged(data, data)
 }
 
-func (*ClusterInfo) warnCell(s string, w bool) string {
-	if w {
-		return fmt.Sprintf("[orangered::b]%s", s)
-	}
-
-	return s
-}
-
 // ClusterInfoChanged notifies the cluster meta was changed.
 func (c *ClusterInfo) ClusterInfoChanged(prev, curr *model.ClusterMeta) {
 	c.app.QueueUpdateDraw(func() {
@@ -140,39 +114,13 @@ func (c *ClusterInfo) ClusterInfoChanged(prev, curr *model.ClusterMeta) {
 			row = c.setCell(row, curr.K9sVer)
 		}
 		row = c.setCell(row, curr.K8sVer)
-		if c.hasMetrics() {
-			row = c.setCell(row, ui.AsPercDelta(prev.Cpu, curr.Cpu))
-			row = c.setCell(row, ui.AsPercDelta(prev.Mem, curr.Mem))
-			c.setDefCon(curr.Cpu, curr.Mem)
-		} else {
-			row = c.setCell(row, c.warnCell(render.NAValue, true))
-			row = c.setCell(row, c.warnCell(render.NAValue, true))
-		}
+		// CPU and MEM rows removed
 		row = c.setCell(row, curr.Program)
 		row = c.setCell(row, curr.EnvironmentType)
 		row = c.setCell(row, curr.ReleaseID)
 		_ = c.setCell(row, curr.Sandbox)
 		c.updateStyle()
 	})
-}
-
-const defconFmt = "%s %s level!"
-
-func (c *ClusterInfo) setDefCon(cpu, mem int) {
-	var set bool
-	l := c.app.Config.K9s.Thresholds.LevelFor(config.CPU, cpu)
-	if l > config.SeverityLow {
-		c.app.Status(flashLevel(l), fmt.Sprintf(defconFmt, flashMessage(l), "CPU"))
-		set = true
-	}
-	l = c.app.Config.K9s.Thresholds.LevelFor(config.MEM, mem)
-	if l > config.SeverityLow {
-		c.app.Status(flashLevel(l), fmt.Sprintf(defconFmt, flashMessage(l), "Memory"))
-		set = true
-	}
-	if !set && !c.app.IsBenchmarking() {
-		c.app.ClearStatus(true)
-	}
 }
 
 func (c *ClusterInfo) updateStyle() {
@@ -184,32 +132,5 @@ func (c *ClusterInfo) updateStyle() {
 		s = s.Foreground(c.styles.K9s.Info.SectionColor.Color())
 		s = s.Background(c.styles.BgColor())
 		c.GetCell(row, 1).SetStyle(s)
-	}
-}
-
-// ----------------------------------------------------------------------------
-// Helpers...
-
-func flashLevel(l config.SeverityLevel) model.FlashLevel {
-	//nolint:exhaustive
-	switch l {
-	case config.SeverityHigh:
-		return model.FlashErr
-	case config.SeverityMedium:
-		return model.FlashWarn
-	default:
-		return model.FlashInfo
-	}
-}
-
-func flashMessage(l config.SeverityLevel) string {
-	//nolint:exhaustive
-	switch l {
-	case config.SeverityHigh:
-		return "Critical"
-	case config.SeverityMedium:
-		return "Warning"
-	default:
-		return "OK"
 	}
 }
