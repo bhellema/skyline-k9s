@@ -18,7 +18,7 @@ require (
 	github.com/itchyny/gojq v0.12.17
 	github.com/lmittmann/tint v1.0.7
 	github.com/mattn/go-colorable v0.1.14
-	github.com/mattn/go-runewidth v0.0.19
+	github.com/mattn/go-runewidth v0.0.31
 	github.com/olekukonko/tablewriter v1.1.1
 	github.com/petergtz/pegomock v2.9.0+incompatible
 	github.com/rakyll/hey v0.1.4
